@@ -71,7 +71,5 @@ object Test extends IOApp with Http4sInterpreter {
       _             <- requestThread.join
       exitCode      <- serverThread.join
     } yield exitCode
-
-  org.log4s.getLogger.info("HEJ")
-
+  
 }
