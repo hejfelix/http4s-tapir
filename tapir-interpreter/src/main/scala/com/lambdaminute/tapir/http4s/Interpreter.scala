@@ -1,7 +1,8 @@
 package com.lambdaminute.tapir.http4s
 import java.nio.charset.StandardCharsets.UTF_8
 
-import cats.data.{EitherT, OptionT}
+import cats.Applicative
+import cats.data._
 import cats.effect.Sync
 import cats.implicits._
 import io.circe.{Encoder, Json}
@@ -47,21 +48,28 @@ trait Http4sInterpreter {
       logger.debug(inputs.mkString("\n"))
 
       val service: HttpRoutes[F] = HttpRoutes[F] { req: Request[F] =>
-        val context = Context(queryParams = req.params,
-                              headers = req.headers,
-                              body = req.as[String],
-                              unmatchedPath = req.uri.renderString)
+        val context: F[Context[F]] =
+          req.bodyAsText.compile.last.map(
+            maybeBody =>
+              Context[F](queryParams = req.params,
+                         headers = req.headers,
+                         body = maybeBody,
+                         unmatchedPath = req.uri.renderString))
 
-        logger.debug(s"Context: ")
-        logger.debug(context.toString)
-        val response: EitherT[F, Error, MatchResult[F]] = matchInputs(inputs)(context)
+        val response: ContextState[F] = matchInputs[F](inputs)
 
-        val options: OptionT[F, I] = response.toOption.map { result =>
-          logger.debug(s"Result of binding: ${result.values}")
-          SeqToParams(result.values).asInstanceOf[I]
-        }
+        val value: F[Either[Error, (Context[F], MatchResult[F])]] = context.map(response.run)
 
-        val res: OptionT[F, F[Either[E, O]]] = options.map(i => paramsAsArgs.applyFn(logic, i))
+        logger.debug(s"Result of binding: ${value}")
+
+        val maybeMatch: OptionT[F, I] = OptionT(value.map(_.toOption.map {
+          case (context, result) =>
+            logger.debug(s"Result of binding: ${result.values}")
+            logger.debug(context.toString)
+            SeqToParams(result.values).asInstanceOf[I]
+        }))
+
+        val res: OptionT[F, F[Either[E, O]]] = maybeMatch.map(i => paramsAsArgs.applyFn(logic, i))
 
         res.flatMapF(_.map {
           case Right(result) =>
@@ -91,20 +99,9 @@ trait Http4sInterpreter {
         Either.left("path doesn't start with \"/\"")
       }
 
-    def getQueryParams(unmatchedPath: String): Either[Error, Map[String, String]] =
-      Either.cond(
-        unmatchedPath.startsWith("?"),
-        unmatchedPath
-          .drop(1)
-          .split("&")
-          .map(s => s.splitAt(s.indexOf("=")))
-          .toMap,
-        s"Couldn't parse query params: $unmatchedPath"
-      )
-
     case class Context[F[_]](queryParams: Map[String, String],
                              headers: Headers,
-                             body: F[String],
+                             body: Option[String],
                              unmatchedPath: String) {
       def getHeader(key: String): Option[String]      = headers.get(CaseInsensitiveString.apply(key)).map(_.value)
       def getQueryParam(name: String): Option[String] = queryParams.get(name)
@@ -119,74 +116,89 @@ trait Http4sInterpreter {
       }
     }
 
-    def handleMapped[II, T, F[_]: Sync](
-        wrapped: EndpointInput[II],
-        f: II => T,
-        inputsTail: Vector[EndpointInput.Single[_]])(ctx: Context[F]): EitherT[F, Error, MatchResult[F]] =
-      matchInputs[F](wrapped.asVectorOfSingle)(ctx).flatMap { result: MatchResult[F] =>
-        matchInputs[F](inputsTail)(result.ctx).map(
-          _.prependValue(f.asInstanceOf[Any => Any].apply(SeqToParams(result.values)))
-        )
-      }
+    def handleMapped[II, T, F[_]: Sync](wrapped: EndpointInput[II],
+                                        f: II => T,
+                                        inputsTail: Vector[EndpointInput.Single[_]]): ContextState[F] =
+      for {
+        r1 <- matchInputs[F](wrapped.asVectorOfSingle)
+        r2 <- matchInputs[F](inputsTail)
+          .map(_.prependValue(f.asInstanceOf[Any => Any].apply(SeqToParams(r1.values))))
+      } yield r2
 
-    private def continueMatch[F[_]: Sync](decodeResult: DecodeResult[Any], inputsTail: Vector[EndpointInput.Single[_]])(
-        ctx: Context[F]): EitherT[F, Error, MatchResult[F]] =
+    private def continueMatch[F[_]: Sync](decodeResult: DecodeResult[Any],
+                                          inputsTail: Vector[EndpointInput.Single[_]]): ContextState[F] =
       decodeResult match {
         case DecodeResult.Value(v) =>
           logger.debug(s"Continuing match: ${v}")
-          matchInputs(inputsTail)(ctx).map(_.prependValue(v))
+          matchInputs[F](inputsTail).map(_.prependValue(v))
         case err =>
-          EitherT.leftT(s"${err.toString}, ${ctx.unmatchedPath}")
+          StateT.inspectF((ctx: Context[F]) => Either.left(s"${err.toString}, ${ctx.unmatchedPath}"))
       }
 
-    def matchInputs[F[_]: Sync](inputs: Vector[EndpointInput.Single[_]])(
-        ctx: Context[F]): EitherT[F, Error, MatchResult[F]] =
-      inputs match {
-        case Vector() => EitherT.rightT[F, Error](MatchResult(Nil, ctx))
-        case EndpointInput.PathSegment(ss: String) +: inputsTail if ctx.unmatchedPath.drop(1).startsWith(ss) =>
-          logger.debug(s"Matched ${ss}")
-          matchInputs(inputsTail)(ctx.dropPath(ss.length + 1))
-        case capture @ EndpointInput.PathCapture(m, name, _, _) +: inputsTail =>
-          logger.debug(s"Capturing path ${name.mkString}: $capture\n${ctx} ")
-          EitherT
-            .fromEither[F] {
-              val next: Either[Error, (DecodeResult[Any], String)] = nextSegment(ctx.unmatchedPath).map {
+    type ContextState[F[_]] = StateT[Either[Error, ?], Context[F], MatchResult[F]]
+    private def getState[F[_]]: StateT[Either[Error, ?], Context[F], Context[F]] = StateT.get
+    private def modifyState[F[_]: Applicative](
+        f: Context[F] => Context[F]): StateT[Either[Error, ?], Context[F], Unit] =
+      StateT.modify[Either[Error, ?], Context[F]](f)
+
+    def matchInputs[F[_]: Sync](inputs: Vector[EndpointInput.Single[_]]): ContextState[F] = inputs match {
+      case Vector() =>
+        StateT(context => Either.right(context, MatchResult[F](Nil, context)))
+      case EndpointInput.PathSegment(ss: String) +: inputsTail =>
+        for {
+          ctx <- getState[F]
+          _   <- modifyState[F](_.dropPath(ss.length + 1))
+          doesMatch = ctx.unmatchedPath.drop(1).startsWith(ss)
+          _         = logger.debug(s"${doesMatch}, ${ctx.unmatchedPath}, ${ss}")
+          r <- if (ctx.unmatchedPath.drop(1).startsWith(ss)) {
+            logger.debug(s"Matched path: ${ss}, $ctx")
+            val value: ContextState[F] = matchInputs[F](inputsTail)
+            value
+          } else {
+            val value: ContextState[F] = StateT.liftF(Either.left(s"Unmatched path segment: ${ss}, ${ctx}"))
+            value
+          }
+        } yield r
+      case capture @ EndpointInput.PathCapture(m, name, _, _) +: inputsTail =>
+        val decodeResult: StateT[Either[Error, ?], Context[F], DecodeResult[Any]] = StateT(
+          (ctx: Context[F]) =>
+            nextSegment(ctx.unmatchedPath)
+              .map {
                 case (segment, remaining) =>
-                  (m.fromString(segment), remaining)
-              }
-              logger.debug(s"Next segment ${name.mkString}: ${next}, ${ctx.unmatchedPath}")
-              next
-            }
-            .flatMap {
-              case (DecodeResult.Value(v), remaining) =>
-                logger.debug(s"Decoded path: ${v}, remaining: ${remaining}")
-                matchInputs(inputsTail)(ctx.copy(unmatchedPath = remaining)).map {
-                  _.prependValue(v)
-                }
-              case decodingFailure =>
-                logger.debug(s"Decode failure ${name.mkString}: ${decodingFailure}")
-                EitherT.leftT(s"Decoding path failed: $decodingFailure")
-            }
-        case q @ EndpointInput.Query(name, m, _, _) +: inputsTail =>
-          logger.debug(s"Capturing query ${name}: $q")
-          continueMatch(m.fromOptionalString(ctx.queryParams.get(name)), inputsTail)(ctx)
-        case EndpointIO.Header(name, m, _, _) +: inputsTail =>
-          logger.debug(s"Matching header: ${name}")
-          continueMatch(m.fromOptionalString(ctx.getHeader(name)), inputsTail)(ctx)
-        case EndpointIO.Body(m, _, _) +: inputsTail =>
-          val body = EitherT.right[Error](ctx.body)
-          body.flatMap(
-            bodyAsString => continueMatch(m.fromOptionalString(Option(bodyAsString)), inputsTail)(ctx)
-          )
-        case EndpointInput.Mapped(wrapped, f, _, _) +: inputsTail =>
-          handleMapped(wrapped, f, inputsTail)(ctx)
-        case EndpointIO.Mapped(wrapped, f, _, _) +: inputsTail =>
-          handleMapped(wrapped, f, inputsTail)(ctx)
-        case notMatched =>
-          logger.debug(s"Could not match: ${inputs}")
-          logger.debug(s"Context: ${ctx}")
-          ???
-      }
+                  logger.debug(s"Capturing path: ${segment}, remaining: ${remaining}, ${name}")
+                  (ctx.copy(unmatchedPath = remaining), m.fromString(segment))
+            })
+
+        decodeResult.flatMap {
+          case DecodeResult.Value(v) =>
+            logger.debug(s"Decoded path: ${v}")
+            matchInputs[F](inputsTail).map(_.prependValue(v))
+          case decodingFailure => StateT.liftF(Either.left(s"Decoding path failed: $decodingFailure"))
+        }
+      case q @ EndpointInput.Query(name, m, _, _) +: inputsTail =>
+        for {
+          ctx <- getState[F]
+          query = m.fromOptionalString(ctx.getQueryParam(name))
+          _     = logger.debug(s"Found query: ${query}, ${name}, ${ctx.headers}")
+          res <- continueMatch(query, inputsTail)
+        } yield res
+      case EndpointIO.Header(name, m, _, _) +: inputsTail =>
+        for {
+          ctx <- getState[F]
+          header = m.fromOptionalString(ctx.getHeader(name))
+          _      = logger.debug(s"Found header: ${header}")
+          res <- continueMatch(header, inputsTail)
+        } yield res
+      case EndpointIO.Body(m, _, _) +: inputsTail =>
+        for {
+          ctx <- getState[F]
+          res <- continueMatch(m.fromOptionalString(ctx.body), inputsTail)
+        } yield res
+      case EndpointInput.Mapped(wrapped, f, _, _) +: inputsTail =>
+        handleMapped(wrapped, f, inputsTail)
+      case EndpointIO.Mapped(wrapped, f, _, _) +: inputsTail =>
+        handleMapped(wrapped, f, inputsTail)
+    }
 
   }
 

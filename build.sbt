@@ -13,6 +13,7 @@ lazy val tapirInterpreter = project
       "com.softwaremill.tapir" %% "akka-http-server"    % V.tapir,
       "ch.qos.logback"         % "logback-classic"      % "1.3.0-alpha4"
     ),
+    addCompilerPlugin("org.spire-math" %% "kind-projector" % "0.9.8"),
     scalaVersion := V.scala,
     scalacOptions ++= Seq("-Ypartial-unification")
   )
