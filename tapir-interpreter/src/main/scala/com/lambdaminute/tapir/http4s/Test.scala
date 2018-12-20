@@ -1,16 +1,11 @@
 package com.lambdaminute.tapir.http4s
-import cats.data.{Kleisli, OptionT}
 import cats.effect.{ExitCode, Fiber, IO, IOApp}
 import tapir._
 import tapir.json.circe._
 import io.circe.generic.auto._
-import org.http4s.{Http, HttpApp, HttpRoutes}
+import org.http4s.{HttpApp, HttpRoutes}
 import org.http4s.server.blaze._
-import cats.effect.ContextShift
-import concurrent.ExecutionContext.Implicits.global
 import cats.implicits._
-import fs2.Stream
-import org.http4s
 import org.http4s.implicits._
 
 object Test extends IOApp with Http4sInterpreter {
@@ -42,8 +37,10 @@ object Test extends IOApp with Http4sInterpreter {
     .toSttpRequest(uri"http://localhost:8080")
     .apply(BooksFromYear("SF", 2016), 20, "xyz-abc-123")
 
-  def bookListingLogic(bfy: BooksFromYear, limit: Limit, at: AuthToken): IO[Either[String, List[Book]]] =
+  def bookListingLogic(bfy: BooksFromYear, limit: Limit, at: AuthToken): IO[Either[String, List[Book]]] = {
+    val _ = (bfy, limit, at)
     IO.pure(Right(List(Book("The Sorrows of Young Werther"))))
+  }
 
   val service: HttpRoutes[IO] = booksListing.toHttp4sService(bookListingLogic _)
 
@@ -71,5 +68,5 @@ object Test extends IOApp with Http4sInterpreter {
       _             <- requestThread.join
       exitCode      <- serverThread.join
     } yield exitCode
-  
+
 }

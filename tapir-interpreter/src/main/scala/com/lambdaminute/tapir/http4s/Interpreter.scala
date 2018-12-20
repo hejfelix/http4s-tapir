@@ -143,7 +143,7 @@ trait Http4sInterpreter {
 
     def matchInputs[F[_]: Sync](inputs: Vector[EndpointInput.Single[_]]): ContextState[F] = inputs match {
       case Vector() =>
-        StateT(context => Either.right(context, MatchResult[F](Nil, context)))
+        StateT(context => Either.right((context, MatchResult[F](Nil, context))))
       case EndpointInput.PathSegment(ss: String) +: inputsTail =>
         for {
           ctx <- getState[F]
@@ -159,7 +159,7 @@ trait Http4sInterpreter {
             value
           }
         } yield r
-      case capture @ EndpointInput.PathCapture(m, name, _, _) +: inputsTail =>
+      case EndpointInput.PathCapture(m, name, _, _) +: inputsTail =>
         val decodeResult: StateT[Either[Error, ?], Context[F], DecodeResult[Any]] = StateT(
           (ctx: Context[F]) =>
             nextSegment(ctx.unmatchedPath)
@@ -175,7 +175,7 @@ trait Http4sInterpreter {
             matchInputs[F](inputsTail).map(_.prependValue(v))
           case decodingFailure => StateT.liftF(Either.left(s"Decoding path failed: $decodingFailure"))
         }
-      case q @ EndpointInput.Query(name, m, _, _) +: inputsTail =>
+      case EndpointInput.Query(name, m, _, _) +: inputsTail =>
         for {
           ctx <- getState[F]
           query = m.fromOptionalString(ctx.getQueryParam(name))
